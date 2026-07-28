@@ -2,6 +2,43 @@ import { type AxiosInstance } from 'axios'
 import { sign, type Algorithm } from 'jsonwebtoken'
 import { type Config } from './types'
 
+/**
+ * Axios config may contain non-serializable objects such as
+ * httpsAgent (SocksProxyAgent / HttpsProxyAgent) which have circular
+ * references.  Instead of maintaining a fragile blacklist of known
+ * problematic keys, we use a strict whitelist approach:
+ *   - Keep primitive values (string / number / boolean) as-is.
+ *   - Keep only the two core object keys — `headers` and `data` —
+ *     round-tripped through JSON to strip any hidden non-serializable
+ *     members.  If even those fail, skip the value entirely.
+ *   - All other object / function / symbol values are ignored.
+ * This guarantees the result is always JSON-serializable regardless
+ * of what axios puts into the config.
+ */
+const CORE_OBJECT_KEYS = ['headers', 'data']
+
+function sanitizeConfig (config: any): Config {
+  if (config === null || config === undefined || typeof config !== 'object') {
+    return config
+  }
+  const safe: Record<string, any> = {}
+  for (const key of Object.keys(config)) {
+    const value = config[key]
+    const type = typeof value
+    if (type === 'string' || type === 'number' || type === 'boolean') {
+      safe[key] = value
+    } else if (CORE_OBJECT_KEYS.includes(key) && value !== null && type === 'object') {
+      try {
+        safe[key] = JSON.parse(JSON.stringify(value))
+      } catch {
+        // Even a core object key may contain circular refs — skip it.
+      }
+    }
+    // Skip all other object / function / symbol / undefined values.
+  }
+  return safe as Config
+}
+
 export class HTTPError extends Error {
   status: number
   statusText: string
@@ -11,11 +48,11 @@ export class HTTPError extends Error {
     super(`status: ${status}
 statusText: ${statusText}
 data: ${JSON.stringify(data, null, 2)}
-config: ${JSON.stringify(config, null, 2)}`)
+config: ${JSON.stringify(sanitizeConfig(config), null, 2)}`)
     this.status = status
     this.statusText = statusText
     this.data = data
-    this.config = config
+    this.config = sanitizeConfig(config)
   }
 }
 
@@ -74,9 +111,13 @@ class ElectermSyncCore {
     } catch (e: any) {
       if (e.response !== undefined && e.response !== null) {
         throw new HTTPError(e.response.status, e.response.statusText, e.response.data, e.response.config)
-      } else {
-        throw e
       }
+      // Sanitize non-serializable properties (e.g. httpsAgent) before re-throwing
+      // so downstream JSON.stringify does not fail on circular references.
+      if (e.config !== undefined && e.config !== null) {
+        e.config = sanitizeConfig(e.config)
+      }
+      throw e
     }
   }
 
